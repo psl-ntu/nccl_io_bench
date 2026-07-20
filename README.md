@@ -42,6 +42,108 @@ makes no NVIDIA- or AMD-specific assumptions anywhere.
 | `dyad_stage.py` | Optional extension that adds a `dyad`-staged phase: each rank self-serves its test file through a real [DYAD](https://github.com/flux-framework/dyad) produce/consume round trip onto node-local storage before the same measurement runs against the staged copy. Only relevant if you're evaluating DYAD specifically; the core benchmark has no DYAD dependency. |
 | `run_nccl_io_bench.sh` | Example driver that sweeps several storage tiers (tmpfs, node-local NVMe, a parallel filesystem, a network-attached flash tier, and DYAD-staged) back-to-back in one job. Written for LLNL Tuolumne (Flux scheduler, Slingshot-11, Cray DataWarp/Rabbit NVMe) — **treat it as a worked example to adapt, not a portable script**: the storage paths, `flux run` flags, and `dyad start` staging step are all site-specific. |
 | `submit_nccl_io_bench.sh` | Thin Flux job-submission wrapper around `run_nccl_io_bench.sh` (sets up DYAD's `LD_LIBRARY_PATH`/`PATH` and submits the job). Also Tuolumne-specific. |
+| `pecan_train_bench.py` | Companion benchmark: the real model and real training-loop phases (see below), instead of a bare all-reduce. |
+| `submit_pecan_train_bench.sh` | Flux job-submission wrapper for `pecan_train_bench.py`. Tuolumne-specific (paths/venv); adapt for your own site. |
+
+## pecan_train_bench.py: a realistic compute+comm companion
+
+`nccl_io_bench.py` isolates fabric contention as cleanly as possible: a bare
+all-reduce, no model, no real DataLoader. That's the right tool for proving
+the *mechanism* exists. But it doesn't reproduce a real training iteration's
+actual cost — in particular, a real `bwd+nccl`-style measurement is
+dominated by backward-pass compute and the optimizer step, not by the
+all-reduce itself (a 76 KB gradient all-reduces in under 1ms uncontended;
+real backward+optimizer.step() commonly costs 100ms+). `pecan_train_bench.py`
+fills that gap: single-file, self-contained reproduction of a real GNN
+training iteration, for when you want a compute+comm workload that's
+faithful to actual training rather than a synthetic stand-in.
+
+It contains:
+
+- **The actual model** — an `EGNN`/`E_GCL` equivariant graph network, copied
+  verbatim (not reimplemented) from a real production training codebase, run
+  through the real forward/backward/optimizer-step/DDP-all-reduce sequence
+  every iteration. Reports its own parameter count and gradient size at
+  startup so you can sanity-check it against whatever model you're
+  comparing against.
+- **Synthetic protein-ligand-complex-shaped graphs** — generated once into an
+  in-memory pool at startup (no external dataset, no HDF5 files), matching
+  real measured shape statistics (atoms/sample, edges/atom at the model's
+  distance cutoff), so there's zero setup cost and no data-license concerns.
+- **Optional real storage I/O** (`--fs-path`) — when set, each DataLoader
+  worker additionally reads real bytes from a test file on that path as
+  part of fetching every sample, so `dl`/`dl_max` in the output reflect
+  genuine storage-tier latency. Point it at Lustre, VAST, node-local NVMe,
+  etc., the same way `nccl_io_bench.py`'s `--fs-path` is used, but with a
+  real model+training loop generating the concurrent compute+comm load
+  instead of a bare tensor fill.
+
+Output uses the same per-iteration line format a real training run would
+log (`startup=... dl=... dl_max=... h2d=... fwd=... bwd+nccl=... iter=...`),
+so it's a drop-in stand-in anywhere you'd otherwise need real training logs.
+
+### Quick start
+
+Pure compute+comm, no I/O at all:
+
+```shell
+flux run -N 4 -n 16 -o mpibind=off --exclusive \
+    python pecan_train_bench.py --batch-size 64 --num-workers 8 --iters 100
+```
+
+With real storage I/O against a filesystem under test:
+
+```shell
+flux run -N 4 -n 16 -o mpibind=off --exclusive \
+    python pecan_train_bench.py --batch-size 64 --num-workers 8 --iters 100 \
+    --fs-path /p/lustre5/yourdir --sample-kb 286
+```
+
+Or via the Flux submission wrapper:
+
+```shell
+bash submit_pecan_train_bench.sh [N_NODES] [ITERS]
+```
+
+### Key options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--batch-size`, `--num-workers` | 64, 8 | Match your real DataLoader's config. |
+| `--iters` / `--epochs` | 100 / 1 | Iterations per epoch (per rank). |
+| `--fs-path` | *(none)* | Storage tier to read real per-sample bytes from (omit for pure-synthetic, zero-I/O mode). |
+| `--sample-kb` | 286 | Real bytes read per sample when `--fs-path` is set (default matches a measured real HDF5+graph-cache average). |
+| `--n-layers`, `--distance-cutoff`, `--out-dim`, `--in-channels`, `--in-edge-nf` | 6, 5.0, 6, 19, 1 | EGNN architecture params — match these to your own model config if it differs. |
+| `--min-atoms`, `--max-atoms`, `--avg-degree` | 400, 1000, 20.0 | Synthetic graph shape (atoms/sample, edges/atom at `--distance-cutoff`) — calibrate to your own workload's measured stats. |
+| `--pool-size` | 256 | Number of distinct synthetic graph templates. |
+
+Run `python pecan_train_bench.py --help` for the full list.
+
+### Known fidelity gaps (validated against real training logs)
+
+Cross-checked against real 4-node/16-GPU PECAN/EGNN training logs (same
+batch size, worker count, and node/GPU topology). Model parameter count
+matched exactly (19,473 params / 76.1 KB gradient) both times. Per-field
+comparison, real vs. this benchmark:
+
+- **Compute+comm only, no `--fs-path`**: overall iteration time landed
+  within ~10% of real training's steady state (`fwd` nearly identical);
+  `bwd+nccl` ran moderately lower (~96ms vs. ~124ms), plausibly because the
+  synthetic graphs are calibrated so nearly all edges already pass the
+  model's distance-cutoff filter, while real graphs likely have more
+  edges filtered out, changing the effective backward FLOPs.
+- **With `--fs-path` against VAST**: reasonably close (`fwd` matched almost
+  exactly; overall `iter` time ran ~2.4x lower than real).
+- **With `--fs-path` against Lustre**: real training showed severe stalls
+  (`dl_max` mean 706ms, max 15.8s, 8% of iterations >1s) that this
+  benchmark's I/O did not reproduce (0 stalls observed). Real DataLoader
+  workers do metadata-heavy HDF5 access — opening and attribute-reading
+  across two separate files per sample — while this benchmark currently
+  does one bulk read from a flat test file per sample, which is much
+  friendlier to Lustre's metadata servers. If you need Lustre-realistic
+  I/O severity specifically, this is the place to improve fidelity next
+  (e.g. splitting each sample's read into several smaller, separately-
+  opened reads to mimic real HDF5 access instead of one bulk read).
 
 ## Quick start
 
