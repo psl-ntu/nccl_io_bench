@@ -293,12 +293,17 @@ class SyntheticPDBGraphDataset(Dataset):
     If `fs_path` is set, __getitem__ additionally performs a real disk read
     of `sample_kb` KB (default 286 KB, matching perf_analysis.md's measured
     real per-sample volume: ~74 KB raw HDF5 + ~212 KB graph-cache) from a
-    per-rank test file at that path -- so `dl`/`dl_max` in this script's
-    output reflects genuine storage-tier latency, exactly like the real
-    DataLoader workers reading real HDF5 files. Point --fs-path at Lustre,
-    VAST, node-local NVMe, etc. to compare, the same way nccl_io_bench.py's
-    --fs-path is used, but with the real model+training loop generating the
-    concurrent compute+comm load instead of a bare tensor fill.
+    per-rank test file at that path -- a single bulk transfer at a random
+    offset -- so `dl`/`dl_max` in this script's output reflects genuine
+    storage-tier latency. Point --fs-path at Lustre, VAST, node-local NVMe,
+    etc. to compare, the same way nccl_io_bench.py's --fs-path is used, but
+    with the real model+training loop generating the concurrent compute+comm
+    load instead of a bare tensor fill.
+
+    This bulk-read approximation only reproduces mild I/O-vs-NCCL
+    interference (see README) -- reproducing the real dataset's severe tail
+    behavior requires genuine HDF5 access patterns, which is what
+    --io-style real (build_real_dataloader, below) uses instead.
     """
 
     def __init__(self, length, pool_size=256, min_atoms=400, max_atoms=1000,
@@ -337,21 +342,27 @@ class SyntheticPDBGraphDataset(Dataset):
     def __len__(self):
         return self.length
 
-    def _read_real_bytes(self):
-        """Read self.sample_bytes from this worker process's own handle on
-        self.read_fpath -- opened lazily so each DataLoader worker (forked
-        independently) gets its own fd, never one inherited/shared across
-        workers from the parent process (mirrors pecan/dataset.py's
-        self._h5_handles lazy-open-per-process pattern)."""
+    def _ensure_open(self):
+        """Lazily open this worker process's own handle on self.read_fpath,
+        so each DataLoader worker (forked independently) gets its own fd,
+        never one inherited/shared across workers from the parent process
+        (mirrors pecan/dataset.py's self._h5_handles lazy-open-per-process
+        pattern)."""
         if self._fh is None:
             import random as _random
             self._fh = open(self.read_fpath, "rb")
             self._file_size = os.fstat(self._fh.fileno()).st_size
             self._rng_io = _random.Random(os.getpid())
-        max_off = max(0, self._file_size - self.sample_bytes)
+
+    def _read_at_random_offset(self, nbytes):
+        max_off = max(0, self._file_size - nbytes)
         offset = self._rng_io.randint(0, max_off)
         self._fh.seek(offset)
-        self._fh.read(self.sample_bytes)
+        self._fh.read(nbytes)
+
+    def _read_real_bytes(self):
+        self._ensure_open()
+        self._read_at_random_offset(self.sample_bytes)
 
     def __getitem__(self, ind):
         if self.read_fpath is not None:
@@ -426,7 +437,15 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--iters", type=int, default=100, help="Iterations per epoch (per rank)")
+    p.add_argument("--iters", type=int, default=100, help="Measured iterations per phase (per rank)")
+    p.add_argument("--warmup", type=int, default=10,
+                   help="Warmup iterations per phase, excluded from reported stats "
+                        "(first iterations pay one-time compile/cache costs that "
+                        "would otherwise confound a baseline-vs-with-io comparison)")
+    p.add_argument("--baseline-only", action="store_true",
+                   help="Run only the no-I/O baseline phase (skip --fs-path phase)")
+    p.add_argument("--io-only", action="store_true",
+                   help="Run only the --fs-path phase (skip the no-I/O baseline)")
     p.add_argument("--lr", type=float, default=0.001)
     p.add_argument("--loss-weight", type=float, default=1.0e-2)
     p.add_argument("--out-dim", type=int, default=6)
@@ -451,11 +470,216 @@ def parse_args():
     p.add_argument("--sample-kb", type=float, default=286.0,
                    help="Real bytes read per sample when --fs-path is set "
                         "(default: 286 = measured real HDF5+graph-cache average)")
+    p.add_argument("--io-style", choices=["flat", "real"], default="flat",
+                   help="'flat': one bulk read of --sample-kb per sample from a "
+                        "synthetic per-rank test file at a random offset -- cheap, "
+                        "dependency-free, but only reproduces mild I/O-vs-NCCL "
+                        "interference (see README). "
+                        "'real': skip the synthetic approximation entirely and use "
+                        "the actual pecan.dataset.Dataset_PDB against real HDF5 "
+                        "files (see --real-csv/--real-graph-cache-dir) -- real "
+                        "coord/feat/edge_index/edge_attr, real group/attribute "
+                        "lookups, no guessing about access shape. Use "
+                        "generate_synthetic_hdf5.py to build a dependency-free "
+                        "dataset with the same on-disk structure if you don't have "
+                        "access to the real one.")
+    p.add_argument("--real-csv", default=None,
+                   help="[io-style=real] Path to the training CSV (real or "
+                        "generate_synthetic_hdf5.py output, e.g. .../synth_all.csv)")
+    p.add_argument("--real-graph-cache-dir", default=None,
+                   help="[io-style=real] Path to the precomputed graph-cache "
+                        "directory (real or generate_synthetic_hdf5.py output)")
+    p.add_argument("--pecan-milan-root",
+                   default="/p/lustre5/wang116/tuolumne/sources/pecan_milan",
+                   help="[io-style=real] Path to the pecan_milan repo, added to "
+                        "sys.path to import the real pecan.dataset.Dataset_PDB")
     p.add_argument("--file-mb", type=int, default=512,
                    help="Per-rank test file size on --fs-path")
     p.add_argument("--no-cleanup", action="store_true",
                    help="Keep the --fs-path test file after the run")
     return p.parse_args()
+
+
+def build_dataloader(args, world, rank, read_fpath):
+    dataset_len = (args.warmup + args.iters) * args.batch_size * world
+    dataset = SyntheticPDBGraphDataset(
+        length=dataset_len, pool_size=args.pool_size,
+        min_atoms=args.min_atoms, max_atoms=args.max_atoms,
+        distance_cutoff=args.distance_cutoff, avg_degree=args.avg_degree,
+        in_channels=args.in_channels, out_dim=args.out_dim, seed=args.seed,
+        read_fpath=read_fpath, sample_kb=args.sample_kb)
+    sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
+    return DataListLoader(dataset=dataset, shuffle=(sampler is None), batch_size=args.batch_size,
+                           num_workers=args.num_workers, sampler=sampler, pin_memory=True, drop_last=True)
+
+
+def build_real_dataloader(args, world, rank):
+    """io-style=real: the actual pecan.dataset.Dataset_PDB against real HDF5
+    files, instead of any synthetic approximation. Returns a dict shaped
+    identically to SyntheticPDBGraphDataset's (data/affinity/rmsd/score/
+    hbond/hpbond/habond/sbond/pbond), so run_phase()'s training loop needs
+    no changes at all -- only the data source differs."""
+    if args.real_csv is None:
+        raise ValueError("--io-style real requires --real-csv")
+    import sys
+    if args.pecan_milan_root not in sys.path:
+        sys.path.insert(0, args.pecan_milan_root)
+    from pecan.dataset import Dataset_PDB
+
+    if rank == 0:
+        print(f"[pecan_train_bench] Loading real dataset metadata from "
+              f"{args.real_csv} (graph_cache_dir={args.real_graph_cache_dir}) ...",
+              flush=True)
+    dataset = Dataset_PDB(
+        modality=3,  # EGNN / graph representation, matching this benchmark's model
+        csv_filepaths=[args.real_csv], h5_filepaths=None, mlhdf_ver=2,
+        label_type=1, rmsd_thres=[2.5, 5], max_atoms=args.max_atoms, max_poses=5,
+        use_crystal=False, affine_xyz=True, h5_driver=None,
+        graph_cache_dir=args.real_graph_cache_dir)
+    if rank == 0:
+        print(f"[pecan_train_bench] Real dataset ready: {len(dataset):,} samples", flush=True)
+
+    sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
+    return DataListLoader(dataset=dataset, shuffle=(sampler is None), batch_size=args.batch_size,
+                           num_workers=args.num_workers, sampler=sampler, pin_memory=True, drop_last=True)
+
+
+def run_phase(label, model, optimizer, loss_mse, dataloader, args, rank, world, device):
+    """Run warmup+iters iterations, tagging every printed line with `label` so
+    the two phases (baseline vs with-io) are distinguishable in the raw log,
+    and return per-iteration metric arrays (rank 0 only, warmup excluded) for
+    the interference-factor comparison in print_comparison()."""
+    import time as time_mod
+
+    model.train()
+    iter_time = time_mod.perf_counter()
+    t_prev_iter_end = None
+    losses = []
+    metrics = {"dl_max": [], "h2d": [], "fwd": [], "bwd_nccl": [], "iter": []}
+    total = args.warmup + args.iters
+    start_time = time_mod.perf_counter()
+
+    for ind, batch in enumerate(dataloader):
+        t_iter_start = time_mod.perf_counter()
+        startup_ms = (t_iter_start - iter_time) * 1000 if ind == 0 else 0.0
+        dl_wait_ms = (t_iter_start - t_prev_iter_end) * 1000 if t_prev_iter_end is not None else 0.0
+
+        if world > 1:
+            dl_wait_max_ms = torch.tensor(dl_wait_ms, device=device)
+            dist.all_reduce(dl_wait_max_ms, op=dist.ReduceOp.MAX)
+            dl_wait_max_ms = dl_wait_max_ms.item()
+        else:
+            dl_wait_max_ms = dl_wait_ms
+
+        use_cuda_events = device.type == "cuda"
+        if use_cuda_events:
+            e_fwd_s = torch.cuda.Event(enable_timing=True)
+            e_fwd_e = torch.cuda.Event(enable_timing=True)
+            e_bwd_s = torch.cuda.Event(enable_timing=True)
+            e_bwd_e = torch.cuda.Event(enable_timing=True)
+
+        t_h2d = time_mod.perf_counter()
+        input_batch = Batch.from_data_list([x["data"] for x in batch]).to(device)
+        affinity = torch.stack([x["affinity"] for x in batch]).float().view(-1).to(device)
+        hbond = torch.stack([x["hbond"] for x in batch]).float().view(-1).to(device)
+        hpbond = torch.stack([x["hpbond"] for x in batch]).float().view(-1).to(device)
+        habond = torch.stack([x["habond"] for x in batch]).float().view(-1).to(device)
+        sbond = torch.stack([x["sbond"] for x in batch]).float().view(-1).to(device)
+        pbond = torch.stack([x["pbond"] for x in batch]).float().view(-1).to(device)
+        h2d_ms = (time_mod.perf_counter() - t_h2d) * 1000
+
+        if use_cuda_events:
+            e_fwd_s.record()
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.use_amp):
+            pred, _, _ = model(input_batch)
+            loss = loss_mse(pred[:, 0].float(), affinity)
+            if args.out_dim > 1:
+                loss_hbond = loss_mse(pred[:, 1].float(), hbond)
+                loss_hpbond = loss_mse(pred[:, 2].float(), hpbond)
+                loss_habond = loss_mse(pred[:, 3].float(), habond)
+                loss_sbond = loss_mse(pred[:, 4].float(), sbond)
+                loss_pbond = loss_mse(pred[:, 5].float(), pbond)
+                loss = loss + (loss_hbond + loss_hpbond + loss_habond + loss_sbond
+                               + loss_pbond) * args.loss_weight
+        if use_cuda_events:
+            e_fwd_e.record()
+
+        if use_cuda_events:
+            e_bwd_s.record()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if use_cuda_events:
+            e_bwd_e.record()
+
+        loss_val = loss.detach().cpu().item()
+        t_prev_iter_end = time_mod.perf_counter()
+        losses.append(loss_val)
+
+        if rank == 0:
+            if use_cuda_events:
+                torch.cuda.synchronize()
+                fwd_ms = e_fwd_s.elapsed_time(e_fwd_e)
+                bwd_ms = e_bwd_s.elapsed_time(e_bwd_e)
+            else:
+                fwd_ms = bwd_ms = 0.0
+            iter_ms = (t_prev_iter_end - t_iter_start) * 1000
+            sec_per_iter = (dl_wait_ms + iter_ms) / 1000.0
+            tag = "warmup" if ind < args.warmup else "meas"
+            print("[%s/%s]-[%d/%d] loss: %f, lr: %f, sec/iter: %.2f  "
+                  "[startup=%.0fms dl=%.0fms dl_max=%.0fms h2d=%.0fms fwd=%.0fms "
+                  "bwd+nccl=%.0fms iter=%.0fms]"
+                  % (label, tag, ind, total, loss_val, args.lr,
+                     sec_per_iter, startup_ms, dl_wait_ms, dl_wait_max_ms, h2d_ms,
+                     fwd_ms, bwd_ms, iter_ms), flush=True)
+            if ind >= args.warmup:
+                metrics["dl_max"].append(dl_wait_max_ms)
+                metrics["h2d"].append(h2d_ms)
+                metrics["fwd"].append(fwd_ms)
+                metrics["bwd_nccl"].append(bwd_ms)
+                metrics["iter"].append(iter_ms)
+
+        if ind + 1 >= total:
+            break
+
+    comp_time = time_mod.perf_counter() - start_time
+    if rank == 0:
+        print("[%s] Elapsed time: %f, Average loss: %f"
+              % (label, comp_time, sum(losses) / len(losses)), flush=True)
+    return {k: np.array(v) for k, v in metrics.items()}
+
+
+def print_comparison(rank, phases):
+    """phases: ordered dict-like list of (label, metrics) pairs. Prints
+    percentiles per phase and, if exactly two phases ran, an interference
+    factor (phase2 median / phase1 median) for bwd_nccl and dl_max --
+    the same style as nccl_io_bench.py's own baseline-vs-with-io report."""
+    if rank != 0:
+        return
+    print()
+    print("=" * 72)
+    print("  pecan_train_bench: baseline vs. with-I/O comparison")
+    print("=" * 72)
+    hdr = f"  {'Phase':<12}  {'bwd+nccl med':>13}  {'p95':>9}  {'max':>9}  {'dl_max med':>11}  {'p95':>9}  {'max':>9}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for label, m in phases:
+        bwd = m["bwd_nccl"]
+        dl = m["dl_max"]
+        print(f"  {label:<12}  {np.median(bwd):>11.1f}ms  {np.percentile(bwd,95):>7.1f}ms  "
+              f"{bwd.max():>7.1f}ms  {np.median(dl):>9.1f}ms  {np.percentile(dl,95):>7.1f}ms  "
+              f"{dl.max():>7.1f}ms")
+    print()
+    if len(phases) == 2:
+        (label1, m1), (label2, m2) = phases
+        bwd_factor = np.median(m2["bwd_nccl"]) / max(np.median(m1["bwd_nccl"]), 0.001)
+        dl_factor = np.median(m2["dl_max"]) / max(np.median(m1["dl_max"]), 0.001)
+        corr = np.corrcoef(m2["dl_max"], m2["bwd_nccl"])[0, 1] if len(m2["dl_max"]) > 1 else float("nan")
+        print(f"  bwd+nccl median, {label2} vs {label1}: {bwd_factor:.2f}x")
+        print(f"  dl_max median,   {label2} vs {label1}: {dl_factor:.2f}x")
+        print(f"  same-iteration corr(dl_max, bwd_nccl) in {label2} phase: {corr:.3f}")
+    print("=" * 72)
+    print()
 
 
 def main():
@@ -488,127 +712,52 @@ def main():
     optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr)
     loss_mse = nn.MSELoss().float()
 
+    phases = []
+
+    if not args.io_only:
+        if rank == 0:
+            print(f"[pecan_train_bench] Phase: baseline (no I/O) ...", flush=True)
+        dataloader = build_dataloader(args, world, rank, read_fpath=None)
+        m = run_phase("baseline", model, optimizer, loss_mse, dataloader, args, rank, world, device)
+        phases.append(("baseline", m))
+        if dist.is_initialized():
+            dist.barrier()
+
     read_fpath = None
-    if args.fs_path is not None:
-        file_bytes = max(args.file_mb << 20, int(args.sample_kb * 1024) * 8)
-        if rank == 0:
-            print(f"[pecan_train_bench] Creating per-rank test files "
-                  f"({file_bytes // 1024 // 1024} MB each) on {args.fs_path} ...", flush=True)
-        if dist.is_initialized():
-            dist.barrier()
-        read_fpath = create_test_file(args.fs_path, file_bytes, rank)
-        if dist.is_initialized():
-            dist.barrier()
-        if rank == 0:
-            print(f"[pecan_train_bench] Test files ready; each DataLoader worker "
-                  f"reads {args.sample_kb:.0f} KB/sample from {args.fs_path}", flush=True)
-
-    dataset_len = args.iters * args.batch_size * world
-    dataset = SyntheticPDBGraphDataset(
-        length=dataset_len, pool_size=args.pool_size,
-        min_atoms=args.min_atoms, max_atoms=args.max_atoms,
-        distance_cutoff=args.distance_cutoff, avg_degree=args.avg_degree,
-        in_channels=args.in_channels, out_dim=args.out_dim, seed=args.seed,
-        read_fpath=read_fpath, sample_kb=args.sample_kb)
-
-    sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True) if world > 1 else None
-    dataloader = DataListLoader(dataset=dataset, shuffle=(sampler is None), batch_size=args.batch_size,
-                                 num_workers=args.num_workers, sampler=sampler, pin_memory=True, drop_last=True)
-
-    if rank == 0:
-        print(f"[pecan_train_bench] len(dataloader): {len(dataloader)}", flush=True)
-
-    import time as time_mod
-
-    for epoch in range(args.epochs):
-        model.train()
-        iter_time = time_mod.perf_counter()
-        t_prev_iter_end = None
-        losses = []
-        start_time = time_mod.perf_counter()
-
-        for ind, batch in enumerate(dataloader):
-            t_iter_start = time_mod.perf_counter()
-            startup_ms = (t_iter_start - iter_time) * 1000 if ind == 0 else 0.0
-            dl_wait_ms = (t_iter_start - t_prev_iter_end) * 1000 if t_prev_iter_end is not None else 0.0
-
-            if world > 1:
-                dl_wait_max_ms = torch.tensor(dl_wait_ms, device=device)
-                dist.all_reduce(dl_wait_max_ms, op=dist.ReduceOp.MAX)
-                dl_wait_max_ms = dl_wait_max_ms.item()
-            else:
-                dl_wait_max_ms = dl_wait_ms
-
-            use_cuda_events = device.type == "cuda"
-            if use_cuda_events:
-                e_fwd_s = torch.cuda.Event(enable_timing=True)
-                e_fwd_e = torch.cuda.Event(enable_timing=True)
-                e_bwd_s = torch.cuda.Event(enable_timing=True)
-                e_bwd_e = torch.cuda.Event(enable_timing=True)
-
-            t_h2d = time_mod.perf_counter()
-            input_batch = Batch.from_data_list([x["data"] for x in batch]).to(device)
-            affinity = torch.stack([x["affinity"] for x in batch]).float().view(-1).to(device)
-            hbond = torch.stack([x["hbond"] for x in batch]).float().view(-1).to(device)
-            hpbond = torch.stack([x["hpbond"] for x in batch]).float().view(-1).to(device)
-            habond = torch.stack([x["habond"] for x in batch]).float().view(-1).to(device)
-            sbond = torch.stack([x["sbond"] for x in batch]).float().view(-1).to(device)
-            pbond = torch.stack([x["pbond"] for x in batch]).float().view(-1).to(device)
-            h2d_ms = (time_mod.perf_counter() - t_h2d) * 1000
-
-            if use_cuda_events:
-                e_fwd_s.record()
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.use_amp):
-                pred, _, _ = model(input_batch)
-                loss = loss_mse(pred[:, 0].float(), affinity)
-                if args.out_dim > 1:
-                    loss_hbond = loss_mse(pred[:, 1].float(), hbond)
-                    loss_hpbond = loss_mse(pred[:, 2].float(), hpbond)
-                    loss_habond = loss_mse(pred[:, 3].float(), habond)
-                    loss_sbond = loss_mse(pred[:, 4].float(), sbond)
-                    loss_pbond = loss_mse(pred[:, 5].float(), pbond)
-                    loss = loss + (loss_hbond + loss_hpbond + loss_habond + loss_sbond
-                                   + loss_pbond) * args.loss_weight
-            if use_cuda_events:
-                e_fwd_e.record()
-
-            if use_cuda_events:
-                e_bwd_s.record()
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            if use_cuda_events:
-                e_bwd_e.record()
-
-            loss_val = loss.detach().cpu().item()
-            t_prev_iter_end = time_mod.perf_counter()
-            losses.append(loss_val)
-
+    real_io = args.io_style == "real"
+    run_with_io = not args.baseline_only and (real_io or args.fs_path is not None)
+    if run_with_io:
+        if real_io:
             if rank == 0:
-                if use_cuda_events:
-                    torch.cuda.synchronize()
-                    fwd_ms = e_fwd_s.elapsed_time(e_fwd_e)
-                    bwd_ms = e_bwd_s.elapsed_time(e_bwd_e)
-                else:
-                    fwd_ms = bwd_ms = 0.0
-                iter_ms = (t_prev_iter_end - t_iter_start) * 1000
-                sec_per_iter = (dl_wait_ms + iter_ms) / 1000.0
-                print("[%d/%d]-[%d/%d] loss: %f, lr: %f, sec/iter: %.2f  "
-                      "[startup=%.0fms dl=%.0fms dl_max=%.0fms h2d=%.0fms fwd=%.0fms "
-                      "bwd+nccl=%.0fms iter=%.0fms]"
-                      % (epoch + 1, args.epochs, ind, len(dataloader), loss_val, args.lr,
-                         sec_per_iter, startup_ms, dl_wait_ms, dl_wait_max_ms, h2d_ms,
-                         fwd_ms, bwd_ms, iter_ms), flush=True)
+                print(f"[pecan_train_bench] Phase: with-io ({args.num_workers} workers/rank, "
+                      f"io-style=real, {args.real_csv}) ...", flush=True)
+            dataloader = build_real_dataloader(args, world, rank)
+        else:
+            file_bytes = max(args.file_mb << 20, int(args.sample_kb * 1024) * 8)
+            if rank == 0:
+                print(f"[pecan_train_bench] Creating per-rank test files "
+                      f"({file_bytes // 1024 // 1024} MB each) on {args.fs_path} ...", flush=True)
+            if dist.is_initialized():
+                dist.barrier()
+            read_fpath = create_test_file(args.fs_path, file_bytes, rank)
+            if dist.is_initialized():
+                dist.barrier()
+            if rank == 0:
+                print(f"[pecan_train_bench] Test files ready; each DataLoader worker "
+                      f"reads {args.sample_kb:.0f} KB/sample from {args.fs_path}", flush=True)
+            if rank == 0:
+                print(f"[pecan_train_bench] Phase: with-io ({args.num_workers} workers/rank, "
+                      f"{args.sample_kb:.0f} KB/sample from {args.fs_path}, "
+                      f"io-style={args.io_style}) ...", flush=True)
+            dataloader = build_dataloader(args, world, rank, read_fpath=read_fpath)
+        m = run_phase("with-io", model, optimizer, loss_mse, dataloader, args, rank, world, device)
+        phases.append(("with-io", m))
+        if dist.is_initialized():
+            dist.barrier()
 
-            if ind + 1 >= args.iters:
-                break
+    print_comparison(rank, phases)
 
-        comp_time = time_mod.perf_counter() - start_time
-        if rank == 0:
-            print("[%d/%d] Elapsed time: %f, Average loss: %f"
-                  % (epoch + 1, args.epochs, comp_time, sum(losses) / len(losses)), flush=True)
-
-    if read_fpath is not None and not args.no_cleanup:
+    if not args.no_cleanup and read_fpath is not None:
         try:
             os.remove(read_fpath)
         except OSError:

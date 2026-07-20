@@ -44,6 +44,7 @@ makes no NVIDIA- or AMD-specific assumptions anywhere.
 | `submit_nccl_io_bench.sh` | Thin Flux job-submission wrapper around `run_nccl_io_bench.sh` (sets up DYAD's `LD_LIBRARY_PATH`/`PATH` and submits the job). Also Tuolumne-specific. |
 | `pecan_train_bench.py` | Companion benchmark: the real model and real training-loop phases (see below), instead of a bare all-reduce. |
 | `submit_pecan_train_bench.sh` | Flux job-submission wrapper for `pecan_train_bench.py`. Tuolumne-specific (paths/venv); adapt for your own site. |
+| `generate_synthetic_hdf5.py` | Generates a dependency-free HDF5 dataset with the real dataset's exact on-disk structure, for use with `pecan_train_bench.py --io-style real` (see below). |
 
 ## pecan_train_bench.py: a realistic compute+comm companion
 
@@ -70,13 +71,21 @@ It contains:
   in-memory pool at startup (no external dataset, no HDF5 files), matching
   real measured shape statistics (atoms/sample, edges/atom at the model's
   distance cutoff), so there's zero setup cost and no data-license concerns.
-- **Optional real storage I/O** (`--fs-path`) — when set, each DataLoader
-  worker additionally reads real bytes from a test file on that path as
-  part of fetching every sample, so `dl`/`dl_max` in the output reflect
-  genuine storage-tier latency. Point it at Lustre, VAST, node-local NVMe,
-  etc., the same way `nccl_io_bench.py`'s `--fs-path` is used, but with a
-  real model+training loop generating the concurrent compute+comm load
-  instead of a bare tensor fill.
+- **Optional real storage I/O**, in one of two styles selected by
+  `--io-style`:
+  - `flat` (default) — each DataLoader worker reads `--sample-kb` KB from a
+    random offset in a synthetic per-rank test file on `--fs-path`, so
+    `dl`/`dl_max` reflect genuine storage-tier latency for a single bulk
+    transfer per sample. Cheap and dependency-free, but — see "Known
+    fidelity gaps" below — only reproduces mild I/O-vs-NCCL interference; a
+    single bulk read per sample is much friendlier to a parallel
+    filesystem's metadata server than real HDF5 access is.
+  - `real` — bypasses the synthetic dataset entirely and uses the actual
+    `pecan.dataset.Dataset_PDB` class against real (or
+    `generate_synthetic_hdf5.py`-generated, see below) HDF5 files via
+    `--real-csv`/`--real-graph-cache-dir`: real per-sample group/attribute
+    lookups, real chunked dataset reads, no guessing about access shape.
+    This is the one that actually reproduces severe Lustre interference.
 
 Output uses the same per-iteration line format a real training run would
 log (`startup=... dl=... dl_max=... h2d=... fwd=... bwd+nccl=... iter=...`),
@@ -91,12 +100,22 @@ flux run -N 4 -n 16 -o mpibind=off --exclusive \
     python pecan_train_bench.py --batch-size 64 --num-workers 8 --iters 100
 ```
 
-With real storage I/O against a filesystem under test:
+With real storage I/O against a filesystem under test (bulk-read approximation):
 
 ```shell
 flux run -N 4 -n 16 -o mpibind=off --exclusive \
     python pecan_train_bench.py --batch-size 64 --num-workers 8 --iters 100 \
     --fs-path /p/lustre5/yourdir --sample-kb 286
+```
+
+With genuine HDF5 access against a real (or generated) dataset:
+
+```shell
+flux run -N 4 -n 16 -o mpibind=off --exclusive \
+    python pecan_train_bench.py --batch-size 64 --num-workers 8 --iters 100 \
+    --io-style real \
+    --real-csv /p/lustre5/yourdir/synth_all.csv \
+    --real-graph-cache-dir /p/lustre5/yourdir/graph_cache
 ```
 
 Or via the Flux submission wrapper:
@@ -105,17 +124,52 @@ Or via the Flux submission wrapper:
 bash submit_pecan_train_bench.sh [N_NODES] [ITERS]
 ```
 
+Each run prints a baseline-vs-with-I/O comparison table (median/p95/max for
+`bwd+nccl` and `dl_max`, plus interference factors) at the end — see
+"Interpreting the report" below.
+
+### generate_synthetic_hdf5.py: a dependency-free real-shaped dataset
+
+`--io-style real` needs real HDF5 files on disk. If you don't have access to
+the actual (private) dataset, `generate_synthetic_hdf5.py` builds one with
+the exact same on-disk structure — nested `h5[pdbid]["dcomplex"][poseid]`
+groups holding `coord`/`feat` datasets and 5 scalar attributes, companion
+`*_graph.h5` files holding precomputed `edge_index`/`edge_attr`, and a
+matching CSV — so `pecan.dataset.Dataset_PDB` (and therefore
+`pecan_train_bench.py`) can't tell the difference structurally, even though
+the content is random.
+
+```shell
+python generate_synthetic_hdf5.py --out-dir /p/lustre5/yourdir/synthdata \
+    --n-files 105 --groups-per-file 2000 --poses-per-group 5 --workers 16
+
+python pecan_train_bench.py --io-style real \
+    --real-csv /p/lustre5/yourdir/synthdata/synth_all.csv \
+    --real-graph-cache-dir /p/lustre5/yourdir/synthdata/graph_cache
+```
+
+`--groups-per-file` matters more than `--n-files` for reproducing
+interference severity: HDF5 switches a group's internal link storage from a
+flat "compact" layout to a B-tree-indexed layout once entry counts cross a
+small threshold (~8-16 by default), and the real dataset's severity appears
+tied to how deep/large that indexed structure gets (real files hold ~10,000
+groups each) rather than just file count. See "Known fidelity gaps" below
+for measured results at different scales.
+
 ### Key options
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--batch-size`, `--num-workers` | 64, 8 | Match your real DataLoader's config. |
 | `--iters` / `--epochs` | 100 / 1 | Iterations per epoch (per rank). |
-| `--fs-path` | *(none)* | Storage tier to read real per-sample bytes from (omit for pure-synthetic, zero-I/O mode). |
-| `--sample-kb` | 286 | Real bytes read per sample when `--fs-path` is set (default matches a measured real HDF5+graph-cache average). |
+| `--io-style` | `flat` | `flat`: one bulk read per sample from a synthetic test file. `real`: genuine `Dataset_PDB` access against real HDF5 files. |
+| `--fs-path` | *(none)* | `[io-style=flat]` Storage tier to read real per-sample bytes from (omit for pure-synthetic, zero-I/O mode). |
+| `--sample-kb` | 286 | `[io-style=flat]` Real bytes read per sample when `--fs-path` is set (default matches a measured real HDF5+graph-cache average). |
+| `--real-csv`, `--real-graph-cache-dir` | *(none)* | `[io-style=real]` Paths to the training CSV and precomputed graph-cache dir (real or `generate_synthetic_hdf5.py` output). |
+| `--baseline-only`, `--io-only` | off | Run just one phase instead of the baseline-vs-with-I/O A/B comparison. |
 | `--n-layers`, `--distance-cutoff`, `--out-dim`, `--in-channels`, `--in-edge-nf` | 6, 5.0, 6, 19, 1 | EGNN architecture params — match these to your own model config if it differs. |
 | `--min-atoms`, `--max-atoms`, `--avg-degree` | 400, 1000, 20.0 | Synthetic graph shape (atoms/sample, edges/atom at `--distance-cutoff`) — calibrate to your own workload's measured stats. |
-| `--pool-size` | 256 | Number of distinct synthetic graph templates. |
+| `--pool-size` | 256 | Number of distinct synthetic graph templates (`--io-style flat` only). |
 
 Run `python pecan_train_bench.py --help` for the full list.
 
@@ -126,24 +180,39 @@ batch size, worker count, and node/GPU topology). Model parameter count
 matched exactly (19,473 params / 76.1 KB gradient) both times. Per-field
 comparison, real vs. this benchmark:
 
-- **Compute+comm only, no `--fs-path`**: overall iteration time landed
-  within ~10% of real training's steady state (`fwd` nearly identical);
-  `bwd+nccl` ran moderately lower (~96ms vs. ~124ms), plausibly because the
-  synthetic graphs are calibrated so nearly all edges already pass the
-  model's distance-cutoff filter, while real graphs likely have more
-  edges filtered out, changing the effective backward FLOPs.
-- **With `--fs-path` against VAST**: reasonably close (`fwd` matched almost
-  exactly; overall `iter` time ran ~2.4x lower than real).
-- **With `--fs-path` against Lustre**: real training showed severe stalls
-  (`dl_max` mean 706ms, max 15.8s, 8% of iterations >1s) that this
-  benchmark's I/O did not reproduce (0 stalls observed). Real DataLoader
-  workers do metadata-heavy HDF5 access — opening and attribute-reading
-  across two separate files per sample — while this benchmark currently
-  does one bulk read from a flat test file per sample, which is much
-  friendlier to Lustre's metadata servers. If you need Lustre-realistic
-  I/O severity specifically, this is the place to improve fidelity next
-  (e.g. splitting each sample's read into several smaller, separately-
-  opened reads to mimic real HDF5 access instead of one bulk read).
+- **Compute+comm only, no I/O**: overall iteration time landed within ~10%
+  of real training's steady state (`fwd` nearly identical); `bwd+nccl` ran
+  moderately lower (~96ms vs. ~124ms), plausibly because the synthetic
+  graphs are calibrated so nearly all edges already pass the model's
+  distance-cutoff filter, while real graphs likely have more edges
+  filtered out, changing the effective backward FLOPs.
+- **`--io-style flat` against VAST**: reasonably close (`fwd` matched
+  almost exactly; overall `iter` time ran ~2.4x lower than real).
+- **`--io-style flat` against Lustre**: does *not* reproduce real
+  training's severe stalls. A same-job baseline-vs-with-io A/B comparison
+  showed only a ~1.0x median effect and no meaningful tail inflation —
+  real training's Lustre run showed `dl_max` mean 706ms, max 15.8s, 8% of
+  iterations >1s. One bulk read per sample (even split into several
+  smaller separately-opened reads against a large randomized file pool —
+  tried and rejected, see git history) is fundamentally too metadata-server
+  -friendly to reproduce this; only genuine HDF5 access does.
+- **`--io-style real` against Lustre, using the actual private dataset**:
+  reproduces the severity dramatically — `bwd+nccl` p95 23x / max 47x over
+  baseline, `dl_max` p95 51x / max 46x, with individual iterations showing
+  genuine 20+ second stalls. This is the closest match to real training
+  found so far.
+- **`--io-style real` against Lustre, using `generate_synthetic_hdf5.py`
+  output**: reproduces the effect partially, and its severity scales with
+  `--groups-per-file`. At `--groups-per-file 500` (105 files, 262K
+  samples, ~33GB): `bwd+nccl` p95 3.6x over baseline (vs. ~1.0x for
+  `--io-style flat`) but median and max stayed close to baseline —
+  real-shaped HDF5 access does perturb the tail even fully synthetic, but
+  not yet at the real dataset's severity. Whether closing the remaining
+  gap requires more groups/file (approaching the real dataset's ~10,000),
+  more total file volume, or genuine multi-rank contention on the *same*
+  files (each rank here still gets its own private synthetic files) is an
+  open question — increase `--groups-per-file` and re-run to test the
+  first hypothesis.
 
 ## Quick start
 
