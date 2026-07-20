@@ -14,7 +14,21 @@ conflated: it runs an NCCL/RCCL all-reduce in a tight loop while background
 reader processes concurrently read data from a filesystem under test, and
 reports whether the all-reduce itself slows down.
 
-## What it measures
+## Files
+
+| File | Purpose |
+|---|---|
+| `nccl_io_bench.py` | The benchmark itself. Portable — only depends on PyTorch (`torch.distributed`) and, optionally, `mpi4py` for rank/world-size discovery. Works under `torchrun`, `mpirun`, or a scheduler-native launcher (e.g. Flux's `flux run`). |
+| `dyad_stage.py` | Optional extension that adds a `dyad`-staged phase: each rank self-serves its test file through a real [DYAD](https://github.com/flux-framework/dyad) produce/consume round trip onto node-local storage before the same measurement runs against the staged copy. Only relevant if you're evaluating DYAD specifically; the core benchmark has no DYAD dependency. |
+| `run_nccl_io_bench.sh` | Example driver that sweeps several storage tiers (tmpfs, node-local NVMe, a parallel filesystem, a network-attached flash tier, and DYAD-staged) back-to-back in one job. Written for LLNL Tuolumne (Flux scheduler, Slingshot-11, Cray DataWarp/Rabbit NVMe) — **treat it as a worked example to adapt, not a portable script**: the storage paths, `flux run` flags, and `dyad start` staging step are all site-specific. |
+| `submit_nccl_io_bench.sh` | Thin Flux job-submission wrapper around `run_nccl_io_bench.sh` (sets up DYAD's `LD_LIBRARY_PATH`/`PATH` and submits the job). Also Tuolumne-specific. |
+| `pecan_train_bench.py` | Companion benchmark: the real model and real training-loop phases (see below), instead of a bare all-reduce. |
+| `submit_pecan_train_bench.sh` | Flux job-submission wrapper for `pecan_train_bench.py`. Tuolumne-specific (paths/venv); adapt for your own site. |
+| `generate_synthetic_hdf5.py` | Generates a dependency-free HDF5 dataset with the real dataset's exact on-disk structure, for use with `pecan_train_bench.py --io-style real` (see below). |
+
+## nccl_io_bench.py: measuring I/O-vs-NCCL fabric interference
+
+### What it measures
 
 Each iteration reports two numbers:
 
@@ -34,17 +48,70 @@ Works with either GPU vendor's collective library — `torch.distributed`'s
 `nccl` backend transparently resolves to RCCL on ROCm builds, and this tool
 makes no NVIDIA- or AMD-specific assumptions anywhere.
 
-## Files
+### Quick start
 
-| File | Purpose |
-|---|---|
-| `nccl_io_bench.py` | The benchmark itself. Portable — only depends on PyTorch (`torch.distributed`) and, optionally, `mpi4py` for rank/world-size discovery. Works under `torchrun`, `mpirun`, or a scheduler-native launcher (e.g. Flux's `flux run`). |
-| `dyad_stage.py` | Optional extension that adds a `dyad`-staged phase: each rank self-serves its test file through a real [DYAD](https://github.com/flux-framework/dyad) produce/consume round trip onto node-local storage before the same measurement runs against the staged copy. Only relevant if you're evaluating DYAD specifically; the core benchmark has no DYAD dependency. |
-| `run_nccl_io_bench.sh` | Example driver that sweeps several storage tiers (tmpfs, node-local NVMe, a parallel filesystem, a network-attached flash tier, and DYAD-staged) back-to-back in one job. Written for LLNL Tuolumne (Flux scheduler, Slingshot-11, Cray DataWarp/Rabbit NVMe) — **treat it as a worked example to adapt, not a portable script**: the storage paths, `flux run` flags, and `dyad start` staging step are all site-specific. |
-| `submit_nccl_io_bench.sh` | Thin Flux job-submission wrapper around `run_nccl_io_bench.sh` (sets up DYAD's `LD_LIBRARY_PATH`/`PATH` and submits the job). Also Tuolumne-specific. |
-| `pecan_train_bench.py` | Companion benchmark: the real model and real training-loop phases (see below), instead of a bare all-reduce. |
-| `submit_pecan_train_bench.sh` | Flux job-submission wrapper for `pecan_train_bench.py`. Tuolumne-specific (paths/venv); adapt for your own site. |
-| `generate_synthetic_hdf5.py` | Generates a dependency-free HDF5 dataset with the real dataset's exact on-disk structure, for use with `pecan_train_bench.py --io-style real` (see below). |
+Single filesystem, via `torchrun`:
+
+```shell
+torchrun --nproc_per_node=4 nccl_io_bench.py --fs-path /path/to/filesystem
+```
+
+Via an MPI-aware launcher (auto-detects rank/world size/hostnames through
+`mpi4py` if available):
+
+```shell
+flux run -N 4 -n 16 python nccl_io_bench.py --fs-path /p/lustre5/yourdir
+mpirun -N 4 -n 16 python nccl_io_bench.py --fs-path /p/lustre5/yourdir
+```
+
+Compare two filesystems by running the same benchmark against each and
+diffing the reports:
+
+```shell
+flux run -N 4 -n 16 python nccl_io_bench.py --fs-path /p/lustre5/x --label lustre
+flux run -N 4 -n 16 python nccl_io_bench.py --fs-path /p/vast1/x   --label vast
+```
+
+Or sweep several tiers (including a DYAD-staged phase) in one job on
+Tuolumne — adapt the storage paths at the top of the script for your own
+system first:
+
+```shell
+bash submit_nccl_io_bench.sh [N_NODES]
+```
+
+### Key options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--fs-path` | *(required)* | Filesystem path to probe, e.g. `/p/lustre5/...`, `/p/vast1/...`, `/dev/shm/...`, or a node-local NVMe mount. |
+| `--io-mode` | `paced` | `paced`: each background reader reads exactly one batch's worth of data per all-reduce iteration, synchronized to the collective — emulates a real multi-process PyTorch `DataLoader` (`num_workers > 0`, each worker its own OS process, no shared GIL with the training loop). `tight`: readers spin in a continuous loop regardless of iteration rate — a raw bandwidth stress test, not a realistic access pattern, and prone to CPU/cache contention unrelated to the fabric. |
+| `--io-workers` | 8 | Background reader processes per rank. |
+| `--batch-size`, `--sample-kb` | 64, 286 | `[paced]` Determines bytes read per worker per iteration: `ceil(batch_size / io_workers)` samples of `sample_kb` KB each. Defaults match a PECAN/EGNN-style GNN training workload; adjust to match your own DataLoader's real per-iteration read volume. |
+| `--tensor-mb` | 0.076 | All-reduce tensor size in MB. Default (76 KB) matches a small GNN gradient; scale up for larger models. |
+| `--iters` / `--warmup` | 100 / 20 | Measured / warmup iterations. |
+| `--label` | *(none)* | Short tag for the report, e.g. `lustre`, `vast`. |
+
+Run `python nccl_io_bench.py --help` for the full list.
+
+### Interpreting the report
+
+The report prints per-phase latency percentiles, a stall count (iterations
+exceeding 10x the no-I/O baseline median), and, when both a baseline and
+with-I/O phase are run, an **interference factor** (`with-I/O median /
+baseline median`) plus a rule-of-thumb verdict:
+
+- **`< 1.5x`** — filesystem and the collective are using separate fabric
+  resources; I/O shouldn't meaningfully impede communication.
+- **`1.5x`–`3x`** — moderate, possibly worth watching at larger scale.
+- **`>= 3x`, or any stalls** — the filesystem's I/O path likely shares the
+  same fabric traffic class as the collective; consider node-local storage
+  or a staging layer (e.g. DYAD) to remove it from the shared path.
+
+Single-node runs are flagged separately: NCCL/RCCL uses intra-node links
+(NVLink/XGMI/PCIe) there, not the network fabric, so single-node contention
+reflects PCIe/CPU sharing, not the fabric-level effect this tool is built to
+isolate — re-run at 2+ nodes for the fabric-contention story.
 
 ## pecan_train_bench.py: a realistic compute+comm companion
 
@@ -126,7 +193,7 @@ bash submit_pecan_train_bench.sh [N_NODES] [ITERS]
 
 Each run prints a baseline-vs-with-I/O comparison table (median/p95/max for
 `bwd+nccl` and `dl_max`, plus interference factors) at the end — see
-"Interpreting the report" below.
+"Interpreting the report" above (same report format as `nccl_io_bench.py`).
 
 ### generate_synthetic_hdf5.py: a dependency-free real-shaped dataset
 
@@ -202,79 +269,26 @@ comparison, real vs. this benchmark:
   genuine 20+ second stalls. This is the closest match to real training
   found so far.
 - **`--io-style real` against Lustre, using `generate_synthetic_hdf5.py`
-  output**: reproduces the effect partially, and its severity scales with
-  `--groups-per-file`. At `--groups-per-file 500` (105 files, 262K
-  samples, ~33GB): `bwd+nccl` p95 3.6x over baseline (vs. ~1.0x for
-  `--io-style flat`) but median and max stayed close to baseline —
-  real-shaped HDF5 access does perturb the tail even fully synthetic, but
-  not yet at the real dataset's severity. Whether closing the remaining
-  gap requires more groups/file (approaching the real dataset's ~10,000),
-  more total file volume, or genuine multi-rank contention on the *same*
-  files (each rank here still gets its own private synthetic files) is an
-  open question — increase `--groups-per-file` and re-run to test the
-  first hypothesis.
-
-## Quick start
-
-Single filesystem, via `torchrun`:
-
-```shell
-torchrun --nproc_per_node=4 nccl_io_bench.py --fs-path /path/to/filesystem
-```
-
-Via an MPI-aware launcher (auto-detects rank/world size/hostnames through
-`mpi4py` if available):
-
-```shell
-flux run -N 4 -n 16 python nccl_io_bench.py --fs-path /p/lustre5/yourdir
-mpirun -N 4 -n 16 python nccl_io_bench.py --fs-path /p/lustre5/yourdir
-```
-
-Compare two filesystems by running the same benchmark against each and
-diffing the reports:
-
-```shell
-flux run -N 4 -n 16 python nccl_io_bench.py --fs-path /p/lustre5/x --label lustre
-flux run -N 4 -n 16 python nccl_io_bench.py --fs-path /p/vast1/x   --label vast
-```
-
-Or sweep several tiers (including a DYAD-staged phase) in one job on
-Tuolumne — adapt the storage paths at the top of the script for your own
-system first:
-
-```shell
-bash submit_nccl_io_bench.sh [N_NODES]
-```
-
-## Key options
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--fs-path` | *(required)* | Filesystem path to probe, e.g. `/p/lustre5/...`, `/p/vast1/...`, `/dev/shm/...`, or a node-local NVMe mount. |
-| `--io-mode` | `paced` | `paced`: each background reader reads exactly one batch's worth of data per all-reduce iteration, synchronized to the collective — emulates a real multi-process PyTorch `DataLoader` (`num_workers > 0`, each worker its own OS process, no shared GIL with the training loop). `tight`: readers spin in a continuous loop regardless of iteration rate — a raw bandwidth stress test, not a realistic access pattern, and prone to CPU/cache contention unrelated to the fabric. |
-| `--io-workers` | 8 | Background reader processes per rank. |
-| `--batch-size`, `--sample-kb` | 64, 286 | `[paced]` Determines bytes read per worker per iteration: `ceil(batch_size / io_workers)` samples of `sample_kb` KB each. Defaults match a PECAN/EGNN-style GNN training workload; adjust to match your own DataLoader's real per-iteration read volume. |
-| `--tensor-mb` | 0.076 | All-reduce tensor size in MB. Default (76 KB) matches a small GNN gradient; scale up for larger models. |
-| `--iters` / `--warmup` | 100 / 20 | Measured / warmup iterations. |
-| `--label` | *(none)* | Short tag for the report, e.g. `lustre`, `vast`. |
-
-Run `python nccl_io_bench.py --help` for the full list.
-
-## Interpreting the report
-
-The report prints per-phase latency percentiles, a stall count (iterations
-exceeding 10x the no-I/O baseline median), and, when both a baseline and
-with-I/O phase are run, an **interference factor** (`with-I/O median /
-baseline median`) plus a rule-of-thumb verdict:
-
-- **`< 1.5x`** — filesystem and the collective are using separate fabric
-  resources; I/O shouldn't meaningfully impede communication.
-- **`1.5x`–`3x`** — moderate, possibly worth watching at larger scale.
-- **`>= 3x`, or any stalls** — the filesystem's I/O path likely shares the
-  same fabric traffic class as the collective; consider node-local storage
-  or a staging layer (e.g. DYAD) to remove it from the shared path.
-
-Single-node runs are flagged separately: NCCL/RCCL uses intra-node links
-(NVLink/XGMI/PCIe) there, not the network fabric, so single-node contention
-reflects PCIe/CPU sharing, not the fabric-level effect this tool is built to
-isolate — re-run at 2+ nodes for the fabric-contention story.
+  output**: reproduces the effect only partially so far, and not in the
+  same *shape* as the real dataset. At `--groups-per-file 500` (105 files,
+  262K samples, ~33GB): `bwd+nccl` p95 3.6x over baseline (vs. ~1.0x for
+  `--io-style flat`) but median and max stayed close to baseline — a mild,
+  tail-only effect, qualitatively like the real dataset's signature (real
+  training's `dl_max` *median* actually drops slightly under I/O, with only
+  p95/max exploding — a bursty effect, not a uniform slowdown), just much
+  smaller in magnitude. At `--groups-per-file 2000` (105 files, 1.05M
+  samples, ~148GB) the picture changed shape rather than simply scaling up:
+  `dl_max` *median* jumped 12.7x (not just its tail), while `bwd+nccl`
+  showed no interference at all (its tail actually tightened vs. baseline).
+  This looks like a cache-size effect rather than more severity — 148GB
+  likely exceeds Lustre's client-side cache where 33GB didn't, so most
+  reads became genuinely cold rather than the access pattern becoming more
+  contended, and once the DataLoader is blocking for that long every
+  iteration, it stops overlapping with the *next* iteration's compute, which
+  may be why `bwd+nccl` stopped showing any effect. Whether the real
+  dataset's bursty, tail-only signature (rather than this uniform-slowdown
+  one) shows up at scales closer to the real ~10,000 groups/file, or
+  requires genuine multi-rank contention on the *same* files (each rank
+  here still gets its own private synthetic files), is still open —
+  a `--groups-per-file 10000` run (matching the real dataset almost
+  exactly, ~5.25M samples, ~700GB) is in progress to test this directly.
