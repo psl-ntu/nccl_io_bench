@@ -18,7 +18,12 @@ shaped graphs, generated once at startup (see SyntheticPDBGraphDataset) and
 served cheaply from an in-memory pool thereafter, so DataLoader-side cost
 reflects real per-sample IPC/collation overhead rather than disk I/O or
 graph construction -- matching how real training reads pre-computed graph
-edges from graph_cache_dir rather than building them on the fly.
+edges from graph_cache_dir rather than building them on the fly. An
+optional --io-style real mode reads actual HDF5 files instead (see
+RealHDF5PDBGraphDataset below); this still has no dependency on the real
+training codebase itself -- only h5py and the CSV/HDF5 file format it reads
+are shared with it -- so the whole script, including this mode, remains a
+single self-contained file.
 
 Per-iteration timing uses the exact same fields/format as pecan/trainer.py,
 so output lines are drop-in compatible with the paper's existing log
@@ -39,9 +44,11 @@ Reproduce a real full-epoch run's shape (5,121 iterations at 4N/16GPU/b64):
 """
 
 import os
+import csv
 import math
 import argparse
 
+import h5py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -388,6 +395,111 @@ class SyntheticPDBGraphDataset(Dataset):
 
 
 # =============================================================================
+# io-style=real: genuine HDF5 access against real (or generate_synthetic_
+# hdf5.py-generated) data, inlined directly here rather than importing the
+# real training codebase's pecan.dataset.Dataset_PDB -- this file has no
+# dependency on that private repo anywhere, by design (see module
+# docstring), and --io-style real is no exception: it reads the exact same
+# on-disk group/dataset/attribute layout Dataset_PDB does, using only h5py
+# and the stdlib csv module.
+# =============================================================================
+
+H5_DCOMPLEX = "dcomplex"
+H5_COORD = "coord"
+H5_FEAT = "feat"
+H5_NUM_HBONDS = "num_hbonds"
+H5_NUM_HYDROPHOBIC = "num_hydrophobic_contacts"
+H5_NUM_HALOGEN = "num_halogenbonds"
+H5_NUM_SALT = "num_salt_bridges"
+H5_NUM_PI = "num_pi_stacking"
+
+
+class RealHDF5PDBGraphDataset(Dataset):
+    """
+    Reads real (or generate_synthetic_hdf5.py-generated) PECAN/SAIR-format
+    HDF5 files directly: nested h5[pdbid]["dcomplex"][poseid] groups holding
+    coord/feat datasets and 5 scalar attributes, plus a companion
+    <fn>_graph.h5 file per raw file holding precomputed edge_index/edge_attr
+    at h5[pdbid][poseid]. This is the same on-disk format and the same
+    per-sample access sequence (CSV row -> raw-file group lookup -> graph-
+    cache-file group lookup) the real training codebase's Dataset_PDB uses --
+    intentionally reimplemented here (only the ~40 lines this benchmark
+    actually needs: docking poses only, affinity labels, graph
+    representation) rather than imported, so this file has zero dependency
+    on the private training repo.
+
+    Only "docking pose" rows are used (poseid 1..max_poses; the crystal-pose
+    poseid==0 case, and the on-the-fly graph-construction fallback for when
+    no graph_cache_dir is given, are both real Dataset_PDB features this
+    benchmark doesn't need and doesn't reimplement).
+    """
+
+    def __init__(self, csv_path, graph_cache_dir, max_poses=5):
+        self.graph_cache_dir = graph_cache_dir
+        self.data_list = []  # (fpath, pdbid, poseid, affinity)
+        with open(csv_path, newline="") as f:
+            for row in csv.DictReader(f):
+                poseid = int(row["poseid"])
+                if poseid == 0 or poseid > max_poses:
+                    continue
+                rmsd = float(row["rmsd"])
+                if rmsd < -1:  # -1000 marks an error row in the real dataset
+                    continue
+                fpath = os.path.join(row["fdir"], row["fn"])
+                self.data_list.append((fpath, row["pdbid"], poseid, float(row["affinity"])))
+
+        self._h5_handles = {}      # per-process cache: fpath -> h5py.File
+        self._graph_handles = {}   # per-process cache: graph_fpath -> h5py.File
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def _h5(self, fpath):
+        if fpath not in self._h5_handles:
+            self._h5_handles[fpath] = h5py.File(fpath, "r")
+        return self._h5_handles[fpath]
+
+    def _graph_h5(self, fn):
+        graph_fpath = os.path.join(self.graph_cache_dir, fn.replace(".h5", "_graph.h5"))
+        if graph_fpath not in self._graph_handles:
+            self._graph_handles[graph_fpath] = h5py.File(graph_fpath, "r")
+        return self._graph_handles[graph_fpath]
+
+    def __getitem__(self, ind):
+        fpath, pdbid, poseid, affinity = self.data_list[ind]
+
+        h5_data = self._h5(fpath)[pdbid][H5_DCOMPLEX][str(poseid)]
+        coord = h5_data[H5_COORD][:]
+        feat = h5_data[H5_FEAT][:]
+        bond_counts = [
+            h5_data.attrs[H5_NUM_HBONDS], h5_data.attrs[H5_NUM_HYDROPHOBIC],
+            h5_data.attrs[H5_NUM_HALOGEN], h5_data.attrs[H5_NUM_SALT],
+            h5_data.attrs[H5_NUM_PI],
+        ]
+
+        gh5 = self._graph_h5(os.path.basename(fpath))
+        g_group = gh5[pdbid][str(poseid)]
+        edge_index = torch.from_numpy(g_group["edge_index"][:]).long()
+        edge_attr = torch.from_numpy(g_group["edge_attr"][:]).float()
+
+        data = Data()
+        data.pos = torch.from_numpy(coord)
+        data.x = torch.from_numpy(feat).float()
+        data.edge_index = edge_index
+        data.edge_attr = edge_attr.view(-1, 1)
+
+        return {
+            "data": data,
+            "affinity": torch.tensor([affinity], dtype=torch.float32),
+            "hbond": torch.tensor([bond_counts[0]], dtype=torch.float32),
+            "hpbond": torch.tensor([bond_counts[1]], dtype=torch.float32),
+            "habond": torch.tensor([bond_counts[2]], dtype=torch.float32),
+            "sbond": torch.tensor([bond_counts[3]], dtype=torch.float32),
+            "pbond": torch.tensor([bond_counts[4]], dtype=torch.float32),
+        }
+
+
+# =============================================================================
 # Distributed init (mpi4py/Flux, falling back to torchrun env vars)
 # =============================================================================
 
@@ -475,11 +587,12 @@ def parse_args():
                         "synthetic per-rank test file at a random offset -- cheap, "
                         "dependency-free, but only reproduces mild I/O-vs-NCCL "
                         "interference (see README). "
-                        "'real': skip the synthetic approximation entirely and use "
-                        "the actual pecan.dataset.Dataset_PDB against real HDF5 "
-                        "files (see --real-csv/--real-graph-cache-dir) -- real "
-                        "coord/feat/edge_index/edge_attr, real group/attribute "
-                        "lookups, no guessing about access shape. Use "
+                        "'real': skip the synthetic approximation entirely and read "
+                        "real HDF5 files directly (see --real-csv/"
+                        "--real-graph-cache-dir, and RealHDF5PDBGraphDataset above) "
+                        "-- real coord/feat/edge_index/edge_attr, real group/"
+                        "attribute lookups, no guessing about access shape, and no "
+                        "dependency on the real training codebase. Use "
                         "generate_synthetic_hdf5.py to build a dependency-free "
                         "dataset with the same on-disk structure if you don't have "
                         "access to the real one.")
@@ -489,10 +602,6 @@ def parse_args():
     p.add_argument("--real-graph-cache-dir", default=None,
                    help="[io-style=real] Path to the precomputed graph-cache "
                         "directory (real or generate_synthetic_hdf5.py output)")
-    p.add_argument("--pecan-milan-root",
-                   default="/p/lustre5/wang116/tuolumne/sources/pecan_milan",
-                   help="[io-style=real] Path to the pecan_milan repo, added to "
-                        "sys.path to import the real pecan.dataset.Dataset_PDB")
     p.add_argument("--file-mb", type=int, default=512,
                    help="Per-rank test file size on --fs-path")
     p.add_argument("--no-cleanup", action="store_true",
@@ -514,28 +623,22 @@ def build_dataloader(args, world, rank, read_fpath):
 
 
 def build_real_dataloader(args, world, rank):
-    """io-style=real: the actual pecan.dataset.Dataset_PDB against real HDF5
-    files, instead of any synthetic approximation. Returns a dict shaped
-    identically to SyntheticPDBGraphDataset's (data/affinity/rmsd/score/
-    hbond/hpbond/habond/sbond/pbond), so run_phase()'s training loop needs
-    no changes at all -- only the data source differs."""
+    """io-style=real: genuine HDF5 access against real (or generate_synthetic_
+    hdf5.py-generated) data via RealHDF5PDBGraphDataset, instead of any
+    synthetic approximation -- and with no dependency on the real training
+    codebase (see that class's docstring). Returns a dict shaped identically
+    to SyntheticPDBGraphDataset's (data/affinity/hbond/hpbond/habond/sbond/
+    pbond), so run_phase()'s training loop needs no changes at all -- only
+    the data source differs."""
     if args.real_csv is None:
         raise ValueError("--io-style real requires --real-csv")
-    import sys
-    if args.pecan_milan_root not in sys.path:
-        sys.path.insert(0, args.pecan_milan_root)
-    from pecan.dataset import Dataset_PDB
 
     if rank == 0:
         print(f"[pecan_train_bench] Loading real dataset metadata from "
               f"{args.real_csv} (graph_cache_dir={args.real_graph_cache_dir}) ...",
               flush=True)
-    dataset = Dataset_PDB(
-        modality=3,  # EGNN / graph representation, matching this benchmark's model
-        csv_filepaths=[args.real_csv], h5_filepaths=None, mlhdf_ver=2,
-        label_type=1, rmsd_thres=[2.5, 5], max_atoms=args.max_atoms, max_poses=5,
-        use_crystal=False, affine_xyz=True, h5_driver=None,
-        graph_cache_dir=args.real_graph_cache_dir)
+    dataset = RealHDF5PDBGraphDataset(
+        csv_path=args.real_csv, graph_cache_dir=args.real_graph_cache_dir, max_poses=5)
     if rank == 0:
         print(f"[pecan_train_bench] Real dataset ready: {len(dataset):,} samples", flush=True)
 

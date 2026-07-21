@@ -147,12 +147,16 @@ It contains:
     fidelity gaps" below — only reproduces mild I/O-vs-NCCL interference; a
     single bulk read per sample is much friendlier to a parallel
     filesystem's metadata server than real HDF5 access is.
-  - `real` — bypasses the synthetic dataset entirely and uses the actual
-    `pecan.dataset.Dataset_PDB` class against real (or
-    `generate_synthetic_hdf5.py`-generated, see below) HDF5 files via
-    `--real-csv`/`--real-graph-cache-dir`: real per-sample group/attribute
-    lookups, real chunked dataset reads, no guessing about access shape.
-    This is the one that actually reproduces severe Lustre interference.
+  - `real` — bypasses the synthetic dataset entirely and reads real (or
+    `generate_synthetic_hdf5.py`-generated, see below) HDF5 files directly
+    via `--real-csv`/`--real-graph-cache-dir`: real per-sample group/
+    attribute lookups, real chunked dataset reads, no guessing about access
+    shape. This is the one that actually reproduces severe Lustre
+    interference. The reader (`RealHDF5PDBGraphDataset` in
+    `pecan_train_bench.py`) is a from-scratch reimplementation of the real
+    training codebase's on-disk access pattern, not an import of it —
+    `pecan_train_bench.py` has no dependency on that codebase in any
+    `--io-style`, only on the HDF5/CSV file format itself.
 
 Output uses the same per-iteration line format a real training run would
 log (`startup=... dl=... dl_max=... h2d=... fwd=... bwd+nccl=... iter=...`),
@@ -202,9 +206,8 @@ the actual (private) dataset, `generate_synthetic_hdf5.py` builds one with
 the exact same on-disk structure — nested `h5[pdbid]["dcomplex"][poseid]`
 groups holding `coord`/`feat` datasets and 5 scalar attributes, companion
 `*_graph.h5` files holding precomputed `edge_index`/`edge_attr`, and a
-matching CSV — so `pecan.dataset.Dataset_PDB` (and therefore
-`pecan_train_bench.py`) can't tell the difference structurally, even though
-the content is random.
+matching CSV — so `pecan_train_bench.py`'s reader can't tell the difference
+structurally, even though the content is random.
 
 ```shell
 python generate_synthetic_hdf5.py --out-dir /p/lustre5/yourdir/synthdata \
@@ -229,7 +232,7 @@ for measured results at different scales.
 |---|---|---|
 | `--batch-size`, `--num-workers` | 64, 8 | Match your real DataLoader's config. |
 | `--iters` / `--epochs` | 100 / 1 | Iterations per epoch (per rank). |
-| `--io-style` | `flat` | `flat`: one bulk read per sample from a synthetic test file. `real`: genuine `Dataset_PDB` access against real HDF5 files. |
+| `--io-style` | `flat` | `flat`: one bulk read per sample from a synthetic test file. `real`: genuine HDF5 group/attribute access against real (or generated) HDF5 files, no dependency on the real training codebase. |
 | `--fs-path` | *(none)* | `[io-style=flat]` Storage tier to read real per-sample bytes from (omit for pure-synthetic, zero-I/O mode). |
 | `--sample-kb` | 286 | `[io-style=flat]` Real bytes read per sample when `--fs-path` is set (default matches a measured real HDF5+graph-cache average). |
 | `--real-csv`, `--real-graph-cache-dir` | *(none)* | `[io-style=real]` Paths to the training CSV and precomputed graph-cache dir (real or `generate_synthetic_hdf5.py` output). |
